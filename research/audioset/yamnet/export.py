@@ -63,6 +63,12 @@ class YAMNet(tf.Module):
             'embeddings': embeddings, 
             'log_mel_spectrogram': log_mel_spectrogram}
 
+sample_rate =  16000
+test_waveforms = [
+  np.random.uniform(-1.0, +1.0,(int(3 * sample_rate),)).astype(np.float32),
+  np.sin(2 * np.pi * 440 *
+                      np.arange(0, 3, 1 / sample_rate), dtype=np.float32)
+                 ]
 
 def check_model(model_fn, class_map_path, params):
   yamnet_classes = yamnet.class_names(class_map_path)
@@ -182,6 +188,70 @@ def make_tflite_export(weights_path, export_dir):
 
   return saved_model_dir
 
+def make_tflite_export_int8(weights_path, export_dir):
+  if os.path.exists(export_dir):
+    log('TF-Lite export already exists in {}, skipping TF-Lite export'.format(
+        export_dir))
+    return
+
+  # Create a TF-Lite compatible Module wrapper around YAMNet.
+  log('Building and checking TF-Lite Module ...')
+  params = yamnet_params.Params(tflite_compatible=True)
+  yamnet = YAMNet(weights_path, params)
+  check_model(yamnet, yamnet.class_map_path(), params)
+  log('Done')
+
+  # Make TF-Lite SavedModel export.
+  log('Making TF-Lite SavedModel export ...')
+  saved_model_dir = os.path.join(export_dir, 'saved_model')
+  os.makedirs(saved_model_dir)
+  tf.saved_model.save(
+      yamnet, saved_model_dir,
+      signatures={'serving_default': yamnet.__call__.get_concrete_function()})
+  log('Done')
+
+  # Check that the export can be loaded and works.
+  log('Checking TF-Lite SavedModel export in TF2 ...')
+  model = tf.saved_model.load(saved_model_dir)
+  check_model(model, model.class_map_path(), params)
+  log('Done')
+
+  # Make a TF-Lite model from the SavedModel.
+  log('Making TF-Lite model ...')
+  dataset = tf.data.Dataset.from_tensor_slices(test_waveforms)
+  def representative_data_gen():
+    for input_value in dataset:
+      # Model has only one input so each data point has one element.
+      yield [input_value]  
+
+  tflite_converter = tf.lite.TFLiteConverter.from_saved_model(
+      saved_model_dir,
+      signature_keys=['serving_default'])
+
+  tflite_converter.representative_dataset = representative_data_gen
+  tflite_converter.optimizations = [tf.lite.Optimize.DEFAULT]
+  #tflite_converter.experimental_new_converter = False
+  #tflite_converter.experimental_new_quantizer = False
+
+  #tflite_converter.inference_type = tf.int8
+  #tflite_converter.inference_input_type = tf.uint8
+  tflite_model = tflite_converter.convert()
+
+  tflite_model_path = os.path.join(export_dir, 'yamnet_int8.tflite')
+  with open(tflite_model_path, 'wb') as f:
+    f.write(tflite_model)
+  log('Done')
+
+  # Check the TF-Lite export.
+  log('Checking TF-Lite model ...')
+  interpreter = tf.lite.Interpreter(tflite_model_path)
+  runner = interpreter.get_signature_runner('serving_default')
+  check_model(runner, 'yamnet_class_map.csv', params)
+  log('Done')
+
+  return saved_model_dir
+
+
 
 def make_tfjs_export(tflite_saved_model_dir, export_dir):
   if os.path.exists(export_dir):
@@ -206,6 +276,10 @@ def main(args):
 
   tflite_export_dir = os.path.join(output_dir, 'tflite')
   tflite_saved_model_dir = make_tflite_export(weights_path, tflite_export_dir)
+
+  tflite_export_dir = os.path.join(output_dir, 'tflite_int8')
+  tflite_saved_model_dir = make_tflite_export_int8(weights_path, tflite_export_dir)
+
 
   tfjs_export_dir = os.path.join(output_dir, 'tfjs')
   make_tfjs_export(tflite_saved_model_dir, tfjs_export_dir)
